@@ -20,7 +20,13 @@ const (
 	bsoFieldPath              = "path"
 	bsoFieldBlobType          = "blob_type"
 	bsoFieldPublicAccessLevel = "public_access_level"
+	bsoFieldBatching          = "batching"
 )
+
+// Maximum approximate block size we accumulate before flushing to a single AppendBlock call.
+// Keep below Azure limits of ~4MB per AppendBlock; 50KB is a conservative default that
+// allows high message counts before hitting the 50,000 block limit.
+const maxAppendBufSize = 50 * 1024
 
 type bsoConfig struct {
 	client            *azblob.Client
@@ -76,7 +82,16 @@ Supports multiple authentication methods but only one of the following is requir
 If multiple are set then the `+"`storage_connection_string`"+` is given priority.
 
 If the `+"`storage_connection_string`"+` does not contain the `+"`AccountName`"+` parameter, please specify it in the
-`+"`storage_account`"+` field.`+service.OutputPerformanceDocs(true, false)).
+`+"`storage_account`"+` field.
+
+When using `+"`APPEND`"+` blob type, the batching configuration controls how messages are
+grouped before being written. Multiple messages in a batch are concatenated into a single
+`+"`AppendBlock`"+` call, which reduces the number of blocks consumed toward the 50,000 block
+limit per blob. This is recommended for high-throughput append workloads.
+
+When using `+"`BLOCK`"+` blob type (default), each message is uploaded as a separate blob
+using `+"`UploadStream`"+`. The batching configuration has no effect on BLOCK blobs as each
+message produces an independent blob object.`+service.OutputPerformanceDocs(true, false)).
 		Fields(
 			service.NewInterpolatedStringField(bsoFieldContainer).
 				Description("The container for uploading the messages to.").
@@ -88,7 +103,7 @@ If the `+"`storage_connection_string`"+` does not contain the `+"`AccountName`"+
 				Example(`${!json("doc.namespace")}/${!json("doc.id")}.json`).
 				Default(`${!count("files")}-${!timestamp_unix_nano()}.txt`),
 			service.NewInterpolatedStringEnumField(bsoFieldBlobType, "BLOCK", "APPEND").
-				Description("Block and Append blobs are comprised of blocks, and each blob can support up to 50,000 blocks. The default value is `+\"`BLOCK`\"+`.`").
+				Description("Block and Append blobs are comprised of blocks, and each blob can support up to 50,000 blocks. When using `+\"`APPEND`\"+` blobs, the batching configuration reduces the number of blocks consumed by concatenating multiple messages into a single `+\"`AppendBlock`\"+` call. When using `+\"`BLOCK`\"+` blobs, each message is uploaded as a separate blob and batching has no effect. The default value is `+\"`BLOCK`\"+`.").
 				Advanced().
 				Default("BLOCK"),
 			service.NewInterpolatedStringEnumField(bsoFieldPublicAccessLevel, "PRIVATE", "BLOB", "CONTAINER").
@@ -96,22 +111,32 @@ If the `+"`storage_connection_string`"+` does not contain the `+"`AccountName`"+
 				Advanced().
 				Default("PRIVATE"),
 			service.NewOutputMaxInFlightField(),
+			service.NewBatchPolicyField(bsoFieldBatching),
 		)
 }
 
 func init() {
-	err := service.RegisterOutput("azure_blob_storage", bsoSpec(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.Output, mif int, err error) {
+	err := service.RegisterBatchOutput("azure_blob_storage", bsoSpec(),
+		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
+			if maxInFlight, err = conf.FieldMaxInFlight(); err != nil {
+				return
+			}
+			if batchPolicy, err = conf.FieldBatchPolicy(bsoFieldBatching); err != nil {
+				return
+			}
 			var pConf bsoConfig
 			if pConf, err = bsoConfigFromParsed(conf); err != nil {
 				return
 			}
-			if mif, err = conf.FieldMaxInFlight(); err != nil {
-				return
+
+			// Warn if batching is configured but blob_type is BLOCK (batching only benefits APPEND blobs).
+			if batchPolicy.Count > 0 || batchPolicy.ByteSize > 0 || batchPolicy.Period != "" {
+				if blobType, berr := pConf.BlobType.TryString(service.NewMessage([]byte(""))); berr == nil && blobType == "BLOCK" {
+					mgr.Logger().Warn("batching configuration has no effect when blob_type is BLOCK; batching only reduces block count for APPEND blobs")
+				}
 			}
-			if out, err = newAzureBlobStorageWriter(pConf, mgr.Logger()); err != nil {
-				return
-			}
+
+			out, err = newAzureBlobStorageWriter(pConf, mgr.Logger())
 			return
 		})
 	if err != nil {
@@ -124,45 +149,163 @@ type azureBlobStorageWriter struct {
 	log  *service.Logger
 }
 
+// Ensure azureBlobStorageWriter implements BatchOutput
+var _ service.BatchOutput = (*azureBlobStorageWriter)(nil)
+
 func newAzureBlobStorageWriter(conf bsoConfig, log *service.Logger) (*azureBlobStorageWriter, error) {
-	a := &azureBlobStorageWriter{
+	return &azureBlobStorageWriter{
 		conf: conf,
 		log:  log,
-	}
-	return a, nil
+	}, nil
 }
 
 func (a *azureBlobStorageWriter) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (a *azureBlobStorageWriter) uploadBlob(ctx context.Context, containerName, blobName, blobType string, message []byte) error {
-	containerClient := a.conf.client.ServiceClient().NewContainerClient(containerName)
-	var err error
-	if blobType == "APPEND" {
-		appendBlobClient := containerClient.NewAppendBlobClient(blobName)
-		_, err = appendBlobClient.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(message)), nil)
-		if err != nil {
-			if isErrorCode(err, bloberror.BlobNotFound) {
-				_, err := appendBlobClient.Create(ctx, nil)
-				if err != nil && !isErrorCode(err, bloberror.BlobAlreadyExists) {
-					return fmt.Errorf("failed to create append blob: %w", err)
-				}
+func (a *azureBlobStorageWriter) WriteBatch(ctx context.Context, msg service.MessageBatch) error {
+	type destKey struct{ container, blob, blobType string }
+	type destBuf struct {
+		msgs        [][]byte
+		byteLen     int
+		accessLevel string // captured from first message for this destination
+	}
+	buffers := make(map[destKey]*destBuf)
 
-				// Try to upload the message again now that we created the blob
-				_, err = appendBlobClient.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(message)), nil)
-				if err != nil {
-					return fmt.Errorf("failed retrying to append block to blob: %w", err)
+	flush := func(d destKey) error {
+		db := buffers[d]
+		if db == nil || len(db.msgs) == 0 {
+			return nil
+		}
+		if d.blobType == "APPEND" {
+			// Concatenate buffered messages into a single AppendBlock call to reduce block count.
+			var agg bytes.Buffer
+			for _, m := range db.msgs {
+				agg.Write(m)
+			}
+			if err := a.uploadAppendBlock(ctx, d.container, d.blob, agg.Bytes()); err != nil {
+				return err
+			}
+		} else {
+			// BLOCK blobs: each message is uploaded as a separate blob via UploadStream.
+			for _, m := range db.msgs {
+				if err := a.uploadBlockBlob(ctx, d.container, d.blob, m); err != nil {
+					return err
 				}
-			} else {
-				return fmt.Errorf("failed to append block to blob: %w", err)
 			}
 		}
-	} else {
-		_, err = containerClient.NewBlockBlobClient(blobName).UploadStream(ctx, bytes.NewReader(message), nil)
-		if err != nil {
-			return fmt.Errorf("failed to push block to blob: %w", err)
+		buffers[d] = &destBuf{accessLevel: db.accessLevel}
+		return nil
+	}
+
+	flushWithRetry := func(d destKey) error {
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if err := flush(d); err != nil {
+				lastErr = err
+				if isErrorCode(err, bloberror.ContainerNotFound) {
+					if cerr := a.createContainer(ctx, d.container, buffers[d].accessLevel); cerr != nil {
+						if !isErrorCode(cerr, bloberror.ContainerAlreadyExists) {
+							return fmt.Errorf("failed to create container: %w", cerr)
+						}
+					}
+					continue
+				}
+				if isTransientError(err) {
+					continue
+				}
+				return err
+			}
+			return nil
 		}
+		return fmt.Errorf("upload failed after retries: %w", lastErr)
+	}
+
+	if err := msg.WalkWithBatchedErrors(func(i int, m *service.Message) error {
+		containerName, err := msg.TryInterpolatedString(i, a.conf.Container)
+		if err != nil {
+			return fmt.Errorf("container interpolation error: %w", err)
+		}
+
+		blobName, err := msg.TryInterpolatedString(i, a.conf.Path)
+		if err != nil {
+			return fmt.Errorf("path interpolation error: %w", err)
+		}
+
+		blobType, err := msg.TryInterpolatedString(i, a.conf.BlobType)
+		if err != nil {
+			return fmt.Errorf("blob type interpolation error: %w", err)
+		}
+
+		mBytes, err := m.AsBytes()
+		if err != nil {
+			return err
+		}
+
+		key := destKey{container: containerName, blob: blobName, blobType: blobType}
+		if buffers[key] == nil {
+			accessLevel, aerr := msg.TryInterpolatedString(i, a.conf.PublicAccessLevel)
+			if aerr != nil {
+				return fmt.Errorf("access level interpolation error: %w", aerr)
+			}
+			buffers[key] = &destBuf{accessLevel: accessLevel}
+		}
+
+		buffers[key].msgs = append(buffers[key].msgs, mBytes)
+		buffers[key].byteLen += len(mBytes)
+
+		// Flush when buffer exceeds threshold. For APPEND blobs this reduces
+		// block count; for BLOCK blobs each message is uploaded individually
+		// regardless but we still flush to bound memory usage.
+		if buffers[key].byteLen >= maxAppendBufSize {
+			if err := flushWithRetry(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Flush remaining buffers with the same retry logic.
+	for k := range buffers {
+		if err := flushWithRetry(k); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// uploadAppendBlock appends data to an APPEND blob, creating the blob if it does not exist.
+func (a *azureBlobStorageWriter) uploadAppendBlock(ctx context.Context, containerName, blobName string, data []byte) error {
+	appendBlobClient := a.conf.client.ServiceClient().NewContainerClient(containerName).NewAppendBlobClient(blobName)
+	_, err := appendBlobClient.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(data)), nil)
+	if err != nil {
+		if isErrorCode(err, bloberror.BlobNotFound) {
+			_, cerr := appendBlobClient.Create(ctx, nil)
+			if cerr != nil && !isErrorCode(cerr, bloberror.BlobAlreadyExists) {
+				return fmt.Errorf("failed to create append blob: %w", cerr)
+			}
+			_, err = appendBlobClient.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(data)), nil)
+			if err != nil {
+				return fmt.Errorf("failed retrying to append block to blob: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to append block to blob: %w", err)
+		}
+	}
+	return nil
+}
+
+// uploadBlockBlob uploads a single message as a BLOCK blob using UploadStream.
+func (a *azureBlobStorageWriter) uploadBlockBlob(ctx context.Context, containerName, blobName string, message []byte) error {
+	_, err := a.conf.client.ServiceClient().
+		NewContainerClient(containerName).
+		NewBlockBlobClient(blobName).
+		UploadStream(ctx, bytes.NewReader(message), nil)
+	if err != nil {
+		return fmt.Errorf("failed to upload block blob: %w", err)
 	}
 	return nil
 }
@@ -181,50 +324,6 @@ func (a *azureBlobStorageWriter) createContainer(ctx context.Context, containerN
 	return err
 }
 
-func (a *azureBlobStorageWriter) Write(ctx context.Context, msg *service.Message) error {
-	containerName, err := a.conf.Container.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("container interpolation error: %s", err)
-	}
-
-	blobName, err := a.conf.Path.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("path interpolation error: %s", err)
-	}
-
-	blobType, err := a.conf.BlobType.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("blob type interpolation error: %s", err)
-	}
-
-	mBytes, err := msg.AsBytes()
-	if err != nil {
-		return err
-	}
-
-	if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
-		if isErrorCode(err, bloberror.ContainerNotFound) {
-			var accessLevel string
-			if accessLevel, err = a.conf.PublicAccessLevel.TryString(msg); err != nil {
-				return fmt.Errorf("access level interpolation error: %s", err)
-			}
-
-			if err := a.createContainer(ctx, containerName, accessLevel); err != nil {
-				if !isErrorCode(err, bloberror.ContainerAlreadyExists) {
-					return fmt.Errorf("failed to create container: %s", err)
-				}
-			}
-
-			if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
-				return fmt.Errorf("error retrying to upload blob: %s", err)
-			}
-		} else {
-			return fmt.Errorf("failed to upload blob: %s", err)
-		}
-	}
-	return nil
-}
-
 func (a *azureBlobStorageWriter) Close(context.Context) error {
 	return nil
 }
@@ -235,5 +334,20 @@ func isErrorCode(err error, code bloberror.Code) bool {
 		return rerr.ErrorCode == string(code)
 	}
 
+	return false
+}
+
+// isTransientError returns true for transient server-side errors.
+func isTransientError(err error) bool {
+	var rerr *azcore.ResponseError
+	if errors.As(err, &rerr) {
+		if rerr.StatusCode >= 500 {
+			return true
+		}
+		switch rerr.ErrorCode {
+		case "InternalError", "ServerBusy":
+			return true
+		}
+	}
 	return false
 }
